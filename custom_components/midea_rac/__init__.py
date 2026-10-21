@@ -1,19 +1,17 @@
 """Midea RAC Wi-Fi air conditioner integration."""
 from __future__ import annotations
 
-import logging
 from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.event import async_track_time_interval
 
 from .api import ObloClient
 from .const import CONF_OWNER, CONF_PHONE, CONF_TOKEN, DOMAIN
 
-_LOGGER = logging.getLogger(__name__)
 PLATFORMS = [Platform.CLIMATE, Platform.FAN, Platform.SELECT, Platform.SENSOR, Platform.SWITCH]
 SCAN_INTERVAL = timedelta(seconds=30)
 CONF_SERIAL = "serial"
@@ -33,9 +31,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await hass.async_add_executor_job(client.disconnect)
         raise ConfigEntryAuthFailed("Midea session expired; please re-enter OTP")
     if not ready:
-        _LOGGER.warning("Midea cloud not ready yet; entities will appear once connected")
+        # Entities are built once from the device list, so let HA retry the setup
+        await hass.async_add_executor_job(client.disconnect)
+        raise ConfigEntryNotReady("Midea cloud did not return the device list in time")
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = client
+    # Session expired while running: ask the user to sign in again
+    client.on_auth_failed = lambda: hass.loop.call_soon_threadsafe(
+        entry.async_start_reauth, hass
+    )
 
     async def _poll(_now):
         await hass.async_add_executor_job(client.refresh, data[CONF_SERIAL])

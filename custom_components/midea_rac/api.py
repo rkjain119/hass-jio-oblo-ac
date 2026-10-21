@@ -7,6 +7,7 @@ import random
 import ssl
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 import paho.mqtt.client as mqtt
@@ -14,6 +15,22 @@ import paho.mqtt.client as mqtt
 from .const import BROKER_HOST, BROKER_PORT
 
 _LOGGER = logging.getLogger(__name__)
+
+# The broker presents a certificate from Oblo's private CA (not sent in the chain), so
+# the public CA bundle cannot verify it. Trust exactly that certificate instead.
+_BROKER_CERT = Path(__file__).with_name("broker.pem")
+
+
+def _broker_tls_context() -> ssl.SSLContext:
+    """TLS context that only accepts the pinned broker certificate."""
+    ctx = ssl.create_default_context(cafile=str(_BROKER_CERT))
+    # Let the pinned leaf act as the trust anchor without its (unpublished) issuer.
+    ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+    # The certificate's only name is CN=jiosmartliving.com (no SAN), which never matches
+    # BROKER_HOST. Pinning the exact certificate is the stronger check, so the
+    # name check is off. Certificate verification itself stays CERT_REQUIRED.
+    ctx.check_hostname = False
+    return ctx
 
 # The full device list can lag a pushed change by several seconds; for this long after an
 # event, keep the event's value instead of the (possibly stale) list value.
@@ -55,13 +72,13 @@ class ObloClient:
         self._connected = threading.Event()
         self._first_state = threading.Event()
         self.auth_failed = False
+        self.on_auth_failed: Callable[[], None] | None = None
         self._state_cbs: list[Callable[[], None]] = []
         self._last_full: dict | None = None
 
         self._mqtt = mqtt.Client(client_id=self._client_id, protocol=mqtt.MQTTv311)
         self._mqtt.username_pw_set(phone, token)
-        self._mqtt.tls_set(cert_reqs=ssl.CERT_NONE)
-        self._mqtt.tls_insecure_set(True)
+        self._mqtt.tls_set_context(_broker_tls_context())
         self._mqtt.on_connect = self._on_connect
         self._mqtt.on_message = self._on_message
         self._mqtt.on_disconnect = self._on_disconnect
@@ -108,6 +125,10 @@ class ObloClient:
             if int(rc) in (4, 5):
                 self.auth_failed = True
                 self._first_state.set()  # unblock setup wait
+                # Stop paho from retrying a dead token forever
+                client.disconnect()
+                if self.on_auth_failed:
+                    self.on_auth_failed()
 
     def _on_disconnect(self, client, userdata, rc, props=None):
         self._connected.clear()
@@ -199,6 +220,11 @@ class ObloClient:
 
     # ---- commands ----
     def _publish(self, serial: str, body: dict) -> None:
+        # Drop while offline: paho would queue forever, and a stale AC command
+        # replayed later is worse than none. A full refresh runs on reconnect.
+        if not self._connected.is_set():
+            _LOGGER.debug("Midea cloud offline, dropping request")
+            return
         topic = self._req_topic_tpl.format(owner=self._owner, serial=serial)
         self._mqtt.publish(topic, json.dumps(body), qos=1)
 

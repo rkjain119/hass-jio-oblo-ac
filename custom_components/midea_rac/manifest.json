@@ -8,5 +8,5 @@
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/rkjain119/hass-midea-rac/issues",
   "requirements": ["paho-mqtt>=1.6.1"],
-  "version": "1.1.0"
+  "version": "1.1.1"
 }
