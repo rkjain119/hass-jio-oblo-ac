@@ -87,16 +87,29 @@ class MideaRacConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
+        # The flow starts in the background, so only send the OTP once the user asks
+        # for it; otherwise it can expire before they ever open the form.
         errors: dict[str, str] = {}
-        entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
-        if user_input is None:
-            # Send a fresh OTP automatically
+        if user_input is not None:
             try:
                 await self.hass.async_add_executor_job(api.send_otp, self._phone)
             except Exception:  # noqa: BLE001
+                _LOGGER.exception("sendotp failed")
                 errors["base"] = "cannot_connect"
+            else:
+                return await self.async_step_reauth_otp()
+        return self.async_show_form(
+            step_id="reauth_confirm", data_schema=vol.Schema({}), errors=errors,
+            description_placeholders={"phone": self._phone or ""},
+        )
+
+    async def async_step_reauth_otp(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
+        if user_input is None:
             return self.async_show_form(
-                step_id="reauth_confirm", data_schema=OTP_SCHEMA, errors=errors,
+                step_id="reauth_otp", data_schema=OTP_SCHEMA, errors=errors,
                 description_placeholders={"phone": self._phone or ""},
             )
         try:
@@ -104,11 +117,13 @@ class MideaRacConfigFlow(ConfigFlow, domain=DOMAIN):
                 api.login, self._phone, user_input["otp"].strip()
             )
         except Exception:  # noqa: BLE001
+            _LOGGER.exception("login failed")
             errors["base"] = "invalid_otp"
             return self.async_show_form(
-                step_id="reauth_confirm", data_schema=OTP_SCHEMA, errors=errors,
+                step_id="reauth_otp", data_schema=OTP_SCHEMA, errors=errors,
                 description_placeholders={"phone": self._phone or ""},
             )
+        entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
         self.hass.config_entries.async_update_entry(
             entry,
             data={

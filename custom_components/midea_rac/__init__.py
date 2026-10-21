@@ -24,6 +24,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ObloClient, data[CONF_PHONE], data[CONF_TOKEN], data[CONF_OWNER], data[CONF_SERIAL]
     )
 
+    # Session expired: ask the user to sign in again. Set before connecting so a
+    # rejection at any point is caught; HA ignores a duplicate reauth flow.
+    client.on_auth_failed = lambda: hass.loop.call_soon_threadsafe(
+        entry.async_start_reauth, hass
+    )
     await hass.async_add_executor_job(client.connect)
     # Bounded wait for the first device list; never blocks startup indefinitely.
     ready = await hass.async_add_executor_job(client.wait_ready, 25)
@@ -33,13 +38,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not ready:
         # Entities are built once from the device list, so let HA retry the setup
         await hass.async_add_executor_job(client.disconnect)
-        raise ConfigEntryNotReady("Midea cloud did not return the device list in time")
+        raise ConfigEntryNotReady(
+            "Midea cloud did not return the device list in time"
+            + (f": {client.last_error}" if client.last_error else "")
+        )
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = client
-    # Session expired while running: ask the user to sign in again
-    client.on_auth_failed = lambda: hass.loop.call_soon_threadsafe(
-        entry.async_start_reauth, hass
-    )
 
     async def _poll(_now):
         await hass.async_add_executor_job(client.refresh, data[CONF_SERIAL])

@@ -5,12 +5,15 @@ import json
 import logging
 import random
 import ssl
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 import paho.mqtt.client as mqtt
+
+from homeassistant.exceptions import HomeAssistantError
 
 from .const import BROKER_HOST, BROKER_PORT
 
@@ -32,9 +35,17 @@ def _broker_tls_context() -> ssl.SSLContext:
     ctx.check_hostname = False
     return ctx
 
+
+class ObloOffline(HomeAssistantError):
+    """A command could not be sent because the cloud connection is down."""
+
+
 # The full device list can lag a pushed change by several seconds; for this long after an
 # event, keep the event's value instead of the (possibly stale) list value.
 _EVENT_HOLD = 20.0
+# Consecutive "not authorized" CONNACKs before treating the session as expired, so a
+# single transient rejection doesn't force an OTP re-login.
+_AUTH_REJECT_LIMIT = 2
 
 
 class ObloNode:
@@ -72,6 +83,9 @@ class ObloClient:
         self._connected = threading.Event()
         self._first_state = threading.Event()
         self.auth_failed = False
+        self._auth_rejects = 0
+        self._fail_logged = False
+        self.last_error: str | None = None
         self.on_auth_failed: Callable[[], None] | None = None
         self._state_cbs: list[Callable[[], None]] = []
         self._last_full: dict | None = None
@@ -80,6 +94,7 @@ class ObloClient:
         self._mqtt.username_pw_set(phone, token)
         self._mqtt.tls_set_context(_broker_tls_context())
         self._mqtt.on_connect = self._on_connect
+        self._mqtt.on_connect_fail = self._on_connect_fail
         self._mqtt.on_message = self._on_message
         self._mqtt.on_disconnect = self._on_disconnect
 
@@ -94,11 +109,15 @@ class ObloClient:
         return self._first_state.wait(timeout)
 
     def disconnect(self) -> None:
+        # Disconnect first so the loop thread sends DISCONNECT and closes the socket.
         try:
-            self._mqtt.loop_stop()
             self._mqtt.disconnect()
         except Exception:  # noqa: BLE001
-            pass
+            _LOGGER.debug("Midea cloud disconnect failed", exc_info=True)
+        try:
+            self._mqtt.loop_stop()
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Midea cloud loop stop failed", exc_info=True)
 
     def set_state_callback(self, cb: Callable[[], None]) -> None:
         self._state_cbs.append(cb)
@@ -114,6 +133,9 @@ class ObloClient:
     def _on_connect(self, client, userdata, flags, rc, props=None):
         if rc == 0:
             _LOGGER.info("Midea cloud MQTT connected")
+            self._auth_rejects = 0
+            self._fail_logged = False
+            self.last_error = None
             client.subscribe(self._rsp_topic)
             client.subscribe(self._evt_topic, qos=1)
             self._connected.set()
@@ -121,14 +143,34 @@ class ObloClient:
             self.refresh(self._serial)
         else:
             _LOGGER.error("Midea cloud MQTT connect failed rc=%s", rc)
+            self.last_error = f"broker refused the connection (rc={rc})"
             # rc 4/5 = bad credentials / not authorized -> token expired
             if int(rc) in (4, 5):
+                self._auth_rejects += 1
+                if self._auth_rejects < _AUTH_REJECT_LIMIT:
+                    return  # paho reconnects; give up only if it is refused again
                 self.auth_failed = True
                 self._first_state.set()  # unblock setup wait
                 # Stop paho from retrying a dead token forever
                 client.disconnect()
                 if self.on_auth_failed:
                     self.on_auth_failed()
+
+    def _on_connect_fail(self, client, userdata):
+        # paho calls this from inside its except block, so the cause is still available
+        exc = sys.exc_info()[1]
+        self.last_error = str(exc) if exc else "connection failed"
+        if self._fail_logged:
+            return  # paho keeps retrying; log once per outage
+        self._fail_logged = True
+        if isinstance(exc, ssl.SSLCertVerificationError):
+            _LOGGER.error(
+                "Midea cloud broker certificate does not match the pinned broker.pem "
+                "(%s); not sending credentials. The broker certificate may have changed",
+                exc.verify_message,
+            )
+        else:
+            _LOGGER.warning("Cannot reach Midea cloud, retrying: %s", self.last_error)
 
     def _on_disconnect(self, client, userdata, rc, props=None):
         self._connected.clear()
@@ -219,14 +261,16 @@ class ObloClient:
         return updated
 
     # ---- commands ----
-    def _publish(self, serial: str, body: dict) -> None:
-        # Drop while offline: paho would queue forever, and a stale AC command
-        # replayed later is worse than none. A full refresh runs on reconnect.
-        if not self._connected.is_set():
-            _LOGGER.debug("Midea cloud offline, dropping request")
-            return
+    def _publish(self, serial: str, body: dict) -> bool:
+        """Send a request now or not at all; returns whether it was sent.
+
+        QoS 0 so paho never stores it for replay: a stale AC command applied after a
+        reconnect is worse than none. A full refresh runs on every reconnect.
+        """
+        if not (self._connected.is_set() and self._mqtt.is_connected()):
+            return False
         topic = self._req_topic_tpl.format(owner=self._owner, serial=serial)
-        self._mqtt.publish(topic, json.dumps(body), qos=1)
+        return self._mqtt.publish(topic, json.dumps(body), qos=0).rc == mqtt.MQTT_ERR_SUCCESS
 
     def refresh(self, serial: str) -> None:
         """Ask the gateway for the full detailed object list."""
@@ -239,7 +283,7 @@ class ObloClient:
         })
 
     def set_property(self, node: ObloNode, service: str, prop: str, value) -> None:
-        self._publish(node.serial, {
+        sent = self._publish(node.serial, {
             "name": "set_service_property_value",
             "sender": self._sender,
             "type": "command",
@@ -251,6 +295,8 @@ class ObloClient:
             },
             "uid": random.randint(1, 2**31),
         })
+        if not sent:
+            raise ObloOffline("Midea cloud is offline; the command was not sent")
 
 
 def discover_account(phone: str, token: str) -> dict:

@@ -13,7 +13,11 @@
       },
       "reauth_confirm": {
         "title": "Re-authenticate",
-        "description": "Your Midea session expired. Enter the new OTP sent to {phone}.",
+        "description": "Your Midea session expired. Submit to send a new OTP by SMS to {phone}."
+      },
+      "reauth_otp": {
+        "title": "Enter OTP",
+        "description": "Enter the OTP sent to {phone}.",
         "data": { "otp": "OTP" }
       }
     },
